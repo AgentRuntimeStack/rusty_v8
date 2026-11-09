@@ -127,6 +127,8 @@ fn main() {
   // because we store everything in a parent directory of OUT_DIR.
   let _lockfile = acquire_lock();
 
+  check_multi_cage_config();
+
   // Build from source
   if env_bool("V8_FROM_SOURCE") {
     if is_asan && env::var_os("OPT_LEVEL").unwrap_or_default() == "0" {
@@ -412,14 +414,21 @@ fn build_v8(is_asan: bool) {
 
   let extra_args = {
     if env::var("CARGO_FEATURE_V8_ENABLE_SANDBOX").is_ok() {
-      vec![
+      let mut opts = vec![
         // Enable pointer compression (along with its dependencies)
         "v8_enable_sandbox=true",
         "v8_enable_external_code_space=true", // Needed for sandbox
         "v8_enable_pointer_compression=true",
         // Note that sandbox requires shared_ro_heap and verify_heap
         // to be true/default
-      ]
+      ];
+      if multi_cage_requested() {
+        // One pointer compression cage, and therefore one sandbox, per
+        // isolate group. V8 configures this combination itself in its
+        // `v8_disable_pointer_compression_shared_cage` builder mixin.
+        opts.push("v8_enable_pointer_compression_shared_cage=false");
+      }
+      opts
     } else {
       let mut opts = vec![
         // Disable sandbox
@@ -430,6 +439,15 @@ fn build_v8(is_asan: bool) {
         opts.push("v8_enable_pointer_compression=true");
       } else {
         opts.push("v8_enable_pointer_compression=false");
+      }
+
+      if multi_cage_requested() {
+        // Give each isolate group its own pointer compression cage, which is
+        // what `v8::IsolateGroup::CanCreateNewGroups()` reports on. V8 turns
+        // `v8_enable_partition_alloc` and `v8_enable_external_code_space` off
+        // by themselves in this mode; both of their defaults are derived from
+        // the shared cage flag.
+        opts.push("v8_enable_pointer_compression_shared_cage=false");
       }
 
       opts
@@ -768,6 +786,52 @@ fn prebuilt_profile() -> &'static str {
   } else {
     "release"
   }
+}
+
+fn multi_cage_requested() -> bool {
+  env::var("CARGO_FEATURE_V8_ENABLE_MULTI_CAGE").is_ok()
+}
+
+/// The multi-cage configuration differs from the published `_ptrcomp` builds in
+/// ways that don't show up at link time: it swaps
+/// `V8_COMPRESS_POINTERS_IN_SHARED_CAGE` for
+/// `V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES` and turns off partition_alloc and
+/// the external code space. Nothing publishes a static library built that way,
+/// so without this check enabling the feature would quietly download the shared
+/// cage `_ptrcomp` library, link successfully, and leave
+/// `IsolateGroup::can_create_new_groups()` returning false at run time.
+fn check_multi_cage_config() {
+  if !multi_cage_requested() {
+    return;
+  }
+  if env::var("CARGO_FEATURE_V8_ENABLE_SANDBOX").is_ok() {
+    // Caller GN args are appended after ours, so refuse any that could turn
+    // the sandbox or the per-group cage back off and link a weaker engine.
+    for key in ["GN_ARGS", "EXTRA_GN_ARGS"] {
+      let value = env::var(key).unwrap_or_default();
+      for arg in [
+        "v8_enable_sandbox",
+        "v8_enable_pointer_compression",
+        "v8_enable_external_code_space",
+      ] {
+        assert!(
+          !value.contains(arg),
+          "{key} must not set {arg}* when both 'v8_enable_sandbox' and \
+           'v8_enable_multi_cage' are enabled"
+        );
+      }
+    }
+  }
+  // A custom archive is the other supported way to consume an experimental
+  // configuration, so take the embedder's word for it if one is supplied.
+  assert!(
+    env_bool("V8_FROM_SOURCE") || env::var_os("RUSTY_V8_ARCHIVE").is_some(),
+    "The 'v8_enable_multi_cage' feature requires building V8 from source (set \
+     V8_FROM_SOURCE=1) or supplying a matching library via RUSTY_V8_ARCHIVE. \
+     No prebuilt libraries are published for this configuration, and the \
+     prebuilt '_ptrcomp' libraries use a shared cage, in which isolate groups \
+     cannot be created."
+  );
 }
 
 fn prebuilt_features_suffix() -> String {

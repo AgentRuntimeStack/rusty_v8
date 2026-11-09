@@ -10,6 +10,7 @@ use std::slice;
 use crate::ArrayBuffer;
 use crate::DataView;
 use crate::Isolate;
+use crate::IsolateGroup;
 use crate::Local;
 use crate::Value;
 use crate::isolate::RealIsolate;
@@ -25,6 +26,9 @@ use crate::support::long;
 
 unsafe extern "C" {
   fn v8__ArrayBuffer__Allocator__NewDefaultAllocator() -> *mut Allocator;
+  fn v8__ArrayBuffer__Allocator__NewDefaultAllocator__with_group(
+    group: *const IsolateGroup,
+  ) -> *mut Allocator;
   fn v8__ArrayBuffer__Allocator__DELETE(this: *mut Allocator);
   fn v8__ArrayBuffer__New__with_byte_length(
     isolate: *mut RealIsolate,
@@ -171,6 +175,30 @@ impl Shared for Allocator {
 pub fn new_default_allocator() -> UniqueRef<Allocator> {
   unsafe {
     UniqueRef::from_raw(v8__ArrayBuffer__Allocator__NewDefaultAllocator())
+  }
+}
+
+/// Convenience allocator scoped to an isolate group.
+///
+/// When the sandbox is enabled, this allocator allocates its backing memory
+/// inside the sandbox belonging to `group`; otherwise it relies on
+/// malloc/free.
+///
+/// V8 only declares this overload when it is built with pointer compression in
+/// multi-cage mode, the same configuration that
+/// [`IsolateGroup::can_create_new_groups`] reports on. `None` is returned when
+/// the V8 this crate was linked against was built differently.
+#[inline(always)]
+pub fn new_default_allocator_for_group(
+  group: &IsolateGroup,
+) -> Option<UniqueRef<Allocator>> {
+  let ptr = unsafe {
+    v8__ArrayBuffer__Allocator__NewDefaultAllocator__with_group(group)
+  };
+  if ptr.is_null() {
+    None
+  } else {
+    Some(unsafe { UniqueRef::from_raw(ptr) })
   }
 }
 

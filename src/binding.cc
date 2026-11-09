@@ -60,6 +60,9 @@ static_assert(sizeof(v8::EscapableHandleScope) ==
 static_assert(sizeof(v8::PromiseRejectMessage) == sizeof(size_t) * 3,
               "PromiseRejectMessage size mismatch");
 
+static_assert(sizeof(v8::IsolateGroup) == sizeof(size_t),
+              "IsolateGroup size mismatch");
+
 static_assert(sizeof(v8::Locker) == sizeof(size_t) * 2, "Locker size mismatch");
 
 static_assert(sizeof(v8::Unlocker) == sizeof(size_t) * 1,
@@ -173,6 +176,138 @@ bool v8__V8__EnableWebAssemblyTrapHandler(bool use_v8_signal_handler) {
 
 v8::Isolate* v8__Isolate__New(const v8::Isolate::CreateParams& params) {
   return v8::Isolate::New(params);
+}
+
+v8::Isolate* v8__Isolate__NewInGroup(const v8::IsolateGroup& group,
+                                     const v8::Isolate::CreateParams& params) {
+  return v8::Isolate::New(group, params);
+}
+
+// `v8::IsolateGroup` is a reference-counted handle whose only member is an
+// `internal::IsolateGroup*`. `make_pod` moves that pointer out without running
+// the destructor, so the reference acquired by `GetDefault`/`Create`/the copy
+// constructor is handed to Rust rather than released here.
+v8::internal::IsolateGroup* v8__IsolateGroup__GetDefault() {
+  return make_pod<v8::internal::IsolateGroup*>(v8::IsolateGroup::GetDefault());
+}
+
+bool v8__IsolateGroup__CanCreateNewGroups() {
+  return v8::IsolateGroup::CanCreateNewGroups();
+}
+
+v8::internal::IsolateGroup* v8__IsolateGroup__Create() {
+  return make_pod<v8::internal::IsolateGroup*>(v8::IsolateGroup::Create());
+}
+
+v8::internal::IsolateGroup* v8__IsolateGroup__CLONE(
+    const v8::IsolateGroup& self) {
+  return make_pod<v8::internal::IsolateGroup*>(v8::IsolateGroup(self));
+}
+
+v8::internal::IsolateGroup* v8__Isolate__GetGroup(const v8::Isolate* isolate) {
+  return make_pod<v8::internal::IsolateGroup*>(isolate->GetGroup());
+}
+
+void v8__IsolateGroup__DESTRUCT(v8::IsolateGroup* self) {
+  self->~IsolateGroup();
+}
+
+bool v8__IsolateGroup__EQ(const v8::IsolateGroup& self,
+                          const v8::IsolateGroup& other) {
+  return self == other;
+}
+
+// Engine configuration probe; layouts mirror src/roost_probe.rs. The macros
+// are those this file was compiled with, and the remaining fields come from
+// the linked V8 library at run time.
+struct roost__EngineConfig {
+  uint32_t abi_version;
+  uint32_t struct_size;
+  bool sandbox;
+  bool compress_pointers;
+  bool multiple_cages;
+  bool shared_cage;
+  bool external_code_space;
+  bool smi_31bit;
+  bool enable_checks;
+  bool can_create_new_groups;
+  bool sandbox_prohibit_insecure_mode;
+  bool freeze_flags_after_init;
+  size_t sandbox_size;
+  size_t typed_array_max_byte_length;
+  const char* version;
+};
+static_assert(sizeof(roost__EngineConfig) == 48,
+              "roost__EngineConfig size mismatch");
+
+struct roost__SandboxInfo {
+  uint32_t abi_version;
+  uint32_t struct_size;
+  uintptr_t address_space_base;
+  size_t address_space_size;
+  size_t size;
+  size_t reservation_size;
+  bool configured_securely;
+  uint8_t mode;
+};
+static_assert(sizeof(roost__SandboxInfo) == 48,
+              "roost__SandboxInfo size mismatch");
+
+void roost__GetEngineConfig(roost__EngineConfig* out) {
+  *out = {};
+  out->abi_version = 1;
+  out->struct_size = sizeof(roost__EngineConfig);
+#ifdef V8_ENABLE_SANDBOX
+  out->sandbox = true;
+  out->sandbox_size = v8::internal::kSandboxSize;
+#endif
+#ifdef V8_COMPRESS_POINTERS
+  out->compress_pointers = true;
+#endif
+#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
+  out->multiple_cages = true;
+#endif
+#ifdef V8_COMPRESS_POINTERS_IN_SHARED_CAGE
+  out->shared_cage = true;
+#endif
+#ifdef V8_EXTERNAL_CODE_SPACE
+  out->external_code_space = true;
+#endif
+#ifdef V8_31BIT_SMIS_ON_64BIT_ARCH
+  out->smi_31bit = true;
+#endif
+#ifdef V8_ENABLE_CHECKS
+  out->enable_checks = true;
+#endif
+  out->can_create_new_groups = v8::IsolateGroup::CanCreateNewGroups();
+  out->sandbox_prohibit_insecure_mode =
+      v8::internal::v8_flags.sandbox_prohibit_insecure_mode;
+  out->freeze_flags_after_init = v8::internal::v8_flags.freeze_flags_after_init;
+  out->typed_array_max_byte_length = v8::TypedArray::kMaxByteLength;
+  out->version = v8::V8::GetVersion();
+}
+
+// The public sandbox queries answer for the sandbox of the isolate group that
+// is current on this thread, so `isolate` is entered for their duration.
+bool roost__Isolate__GetSandboxInfo(v8::Isolate* isolate,
+                                    roost__SandboxInfo* out) {
+  *out = {};
+  out->abi_version = 1;
+  out->struct_size = sizeof(roost__SandboxInfo);
+#ifdef V8_ENABLE_SANDBOX
+  v8::Isolate::Scope isolate_scope(isolate);
+  v8::VirtualAddressSpace* space = v8::V8::GetSandboxAddressSpace();
+  out->address_space_base = space->base();
+  out->address_space_size = space->size();
+  out->size = v8::V8::GetSandboxSizeInBytes();
+  out->reservation_size = v8::V8::GetSandboxReservationSizeInBytes();
+  out->configured_securely = v8::V8::IsSandboxConfiguredSecurely();
+  out->mode = static_cast<uint8_t>(v8::V8::GetSandboxMode());
+  return true;
+#else
+  (void)isolate;
+  return false;
+#endif
 }
 
 void v8__Isolate__Dispose(v8::Isolate* isolate) { isolate->Dispose(); }
@@ -2139,6 +2274,21 @@ class RustAllocator : public v8::ArrayBuffer::Allocator {
 
 v8::ArrayBuffer::Allocator* v8__ArrayBuffer__Allocator__NewDefaultAllocator() {
   return v8::ArrayBuffer::Allocator::NewDefaultAllocator();
+}
+
+// Returns nullptr unless V8 was built with pointer compression in multi-cage
+// mode, which is the only configuration in which V8 declares the group-scoped
+// overload.
+v8::ArrayBuffer::Allocator*
+v8__ArrayBuffer__Allocator__NewDefaultAllocator__with_group(
+    const v8::IsolateGroup& group) {
+#if defined(V8_COMPRESS_POINTERS) && \
+    !defined(V8_COMPRESS_POINTERS_IN_SHARED_CAGE)
+  return v8::ArrayBuffer::Allocator::NewDefaultAllocator(group);
+#else
+  (void)group;
+  return nullptr;
+#endif
 }
 
 v8::ArrayBuffer::Allocator* v8__ArrayBuffer__Allocator__NewRustAllocator(

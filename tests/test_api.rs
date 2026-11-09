@@ -784,6 +784,164 @@ fn microtasks() {
 }
 
 #[test]
+fn default_allocator_for_isolate_group() {
+  let _setup_guard = setup::parallel_test();
+  let group = v8::IsolateGroup::get_default();
+  let allocator = v8::new_default_allocator_for_group(&group);
+  // V8 only offers the group-scoped allocator in multi-cage pointer
+  // compression builds, which is exactly when new groups can be created.
+  assert_eq!(
+    allocator.is_some(),
+    v8::IsolateGroup::can_create_new_groups()
+  );
+}
+
+#[test]
+fn roost_probe_reports_linked_configuration() {
+  let _setup_guard = setup::parallel_test();
+  let config = v8::roost_probe::engine_config();
+  assert_eq!(config.abi_version, v8::roost_probe::ABI_VERSION);
+  assert_eq!(config.version, v8::V8::get_version());
+  assert_eq!(
+    config.typed_array_max_byte_length,
+    v8::TypedArray::MAX_BYTE_LENGTH
+  );
+  assert_eq!(config.sandbox, cfg!(feature = "v8_enable_sandbox"));
+  assert_eq!(
+    config.can_create_new_groups,
+    v8::IsolateGroup::can_create_new_groups()
+  );
+  assert_eq!(config.can_create_new_groups, config.multiple_cages);
+  assert!(!(config.multiple_cages && config.shared_cage));
+
+  let info = v8::Isolate::new(Default::default()).sandbox_info();
+  assert_eq!(info.is_some(), config.sandbox);
+  if let Some(info) = &info {
+    assert_eq!(info.size, config.sandbox_size);
+    assert!(info.address_space_size >= info.size);
+  }
+  if !(config.sandbox && config.can_create_new_groups) {
+    return;
+  }
+
+  // Each group reserves its own sandbox.
+  let groups = [v8::IsolateGroup::create(), v8::IsolateGroup::create()];
+  let mut isolates = Vec::new();
+  for group in &groups {
+    let allocator = v8::new_default_allocator_for_group(group).unwrap();
+    isolates.push(v8::Isolate::new_with_group(
+      group,
+      v8::CreateParams::default().array_buffer_allocator(allocator),
+    ));
+  }
+  let infos: Vec<_> = isolates
+    .iter()
+    .map(|isolate| isolate.sandbox_info().unwrap())
+    .collect();
+  while let Some(isolate) = isolates.pop() {
+    drop(isolate);
+  }
+  let [a, b] = [&infos[0], &infos[1]];
+  assert!(
+    a.address_space_base + a.address_space_size <= b.address_space_base
+      || b.address_space_base + b.address_space_size <= a.address_space_base
+  );
+  assert_ne!(Some(a), info.as_ref());
+}
+
+#[test]
+fn isolate_groups() {
+  let _setup_guard = setup::parallel_test();
+
+  // The default group always exists, and is equal to itself.
+  let default_group = v8::IsolateGroup::get_default();
+  assert_eq!(default_group, v8::IsolateGroup::default());
+  assert_eq!(default_group, default_group.clone());
+
+  // An isolate created without naming a group lands in the default one.
+  {
+    let isolate = v8::Isolate::new(Default::default());
+    assert_eq!(isolate.get_group(), default_group);
+  }
+
+  {
+    let isolate =
+      &mut v8::Isolate::new_with_group(&default_group, Default::default());
+    assert_eq!(isolate.get_group(), default_group);
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let result = eval(scope, "1 + 1").unwrap().int32_value(scope).unwrap();
+    assert_eq!(result, 2);
+  }
+
+  if !v8::IsolateGroup::can_create_new_groups() {
+    // Multiple groups need pointer compression in multi-cage mode, which is not
+    // how this crate's published builds are configured. Everything below is
+    // skipped rather than failing, so the binding still gets exercised above.
+    assert!(v8::IsolateGroup::try_create().is_none());
+    eprintln!(
+      "isolate_groups: skipping multi-group checks, V8 was built without \
+       support for creating new isolate groups"
+    );
+    return;
+  }
+
+  let group1 = v8::IsolateGroup::create();
+  let group2 = v8::IsolateGroup::create();
+  assert_ne!(group1, group2);
+  assert_ne!(group1, default_group);
+  assert_eq!(group1, group1.clone());
+
+  // The isolate acquires its own reference to the group, so the caller's
+  // handle can be dropped while the isolate remains alive.
+  {
+    let group = v8::IsolateGroup::create();
+    let isolate = &mut v8::Isolate::new_with_group(&group, Default::default());
+    drop(group);
+    let isolate_group = isolate.get_group();
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let result = eval(scope, "1 + 1").unwrap().int32_value(scope).unwrap();
+    assert_eq!(result, 2);
+    drop(isolate_group);
+  }
+
+  // Two isolates asked for the same group land in the same group, and isolates
+  // in distinct groups run independently on their own threads.
+  fn run_in_group(group: v8::IsolateGroup) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+      for _ in 0..2 {
+        let isolate =
+          &mut v8::Isolate::new_with_group(&group, Default::default());
+        // Both iterations ask for the same group and get it, so this is what
+        // establishes that `new_with_group` honours its argument rather than
+        // quietly falling back to the default group.
+        assert_eq!(isolate.get_group(), group);
+        v8::scope!(let scope, isolate);
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let result = eval(scope, "1 + 1").unwrap().int32_value(scope).unwrap();
+        assert_eq!(result, 2);
+      }
+    })
+  }
+
+  let threads = [
+    run_in_group(default_group.clone()),
+    run_in_group(group1.clone()),
+    run_in_group(group2.clone()),
+  ];
+  for thread in threads {
+    thread.join().unwrap();
+  }
+
+  // Dropping our references is safe while the groups' isolates are long gone.
+  drop((group1, group2, default_group));
+}
+
+#[test]
 #[should_panic(
   expected = "v8::OwnedIsolate instances must be dropped in the reverse order of creation. They are entered upon creation and exited upon being dropped."
 )]
